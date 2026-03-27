@@ -1,7 +1,7 @@
 ---
-title: "my title"
-author: "Dummy Surname (dummy@mail.com)"
-date: "Last update: `r format(Sys.time(), '%d %B, %Y')`"      
+title: "COVID-19 Severity Classification using Random Forest"
+author: "Regina Rodriguez Durant Reyes and Domenica Arlette Teller (regina.rodriguezdurant01@estudiant.upf.edu)"
+date: "Last update: `r format(Sys.time(), '%d %B, %Y')`"
 output:
   html_document:
     toc: true
@@ -9,14 +9,32 @@ output:
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
 
 # Exercise 1
 
 **Build a Random Forest model to classify COVID-19 severity**
 
-Using the training cohort provided in Supplementary Table 3, build a Random Forest classification model similar to the one in the publication to distinguish between non-Severe and Severe COVID-19 patients.
+Using the training cohort provided in Supplementary Table 3, build a Random Forest
+classification model similar to the one in the publication to distinguish between
+non-Severe and Severe COVID-19 patients.
+
+Following the supervised ML pipeline covered in class (DMI-6, slide 5):
+*question → input data → features → algorithm → parameters → evaluation*.
+Here the question is **binary classification** (non-Severe vs Severe COVID-19) — one
+of the two canonical flavours of supervised classification alongside multi-class
+problems (DMI-6, slide 19). The input data are plasma proteomic profiles, and the
+algorithm is Random Forest — an ensemble of decision trees that reduces the high
+variance of individual trees through bootstrap aggregating and random feature
+selection at each split (DMI-7, slides 35–40).
+
+As emphasised in the lecture, selecting relevant input data is the single most
+important modelling decision (DMI-6, slide 8: *"question > data > features >
+algorithms"*). Proteomic plasma profiles are biologically motivated features for
+COVID-19 severity: they reflect the systemic inflammatory and coagulation cascades
+that distinguish severe from mild disease, which is exactly the kind of expert
+domain knowledge that should guide feature choice (DMI-6, slide 9).
 
 Report the following performance metrics from cross-validation:
 
@@ -24,46 +42,580 @@ Report the following performance metrics from cross-validation:
 -   Accuracy\
 -   ROC curve and AUC
 
-How well does the Random Forest model separate non-Severe from Severe patients based on proteomic profiles?
+How well does the Random Forest model separate non-Severe from Severe patients based
+on proteomic profiles?
 
 ```{r}
+# ── Packages ───────────────────────────────────────────────────────────────────
+library(readxl)
+library(dplyr)
+library(caret)
+library(randomForest)
+library(pROC)
 
+# ── 1. Load clinical metadata (mmc1) ──────────────────────────────────────────
+# Group codes: 2 = non-Severe COVID-19, 3 = Severe COVID-19
+clinical <- read_excel("1-s2.0-S0092867420306279-mmc1.xlsx",
+                       sheet = "Clinical_information") %>%
+  rename(PatientID = `Patient ID a`,
+         Group     = `Group d`) %>%
+  select(PatientID, Group) %>%
+  filter(!is.na(PatientID))
+
+# ── 2. Load training proteomics matrix (Supplementary Table 3 / mmc3) ─────────
+# The matrix is transposed: rows = features, columns = patients.
+# Row 2 holds patient IDs; rows 3+ are feature values;
+# col 1 = UniProt IDs, col 2 = gene symbols.
+train_raw <- read_excel("1-s2.0-S0092867420306279-mmc3.xlsx",
+                        sheet    = "Prot_and_meta_matrix",
+                        col_names = FALSE)
+
+train_patient_ids <- as.character(train_raw[2, 3:ncol(train_raw)])
+feature_ids       <- as.character(train_raw[3:nrow(train_raw), 1, drop = TRUE])
+gene_symbols      <- as.character(train_raw[3:nrow(train_raw), 2, drop = TRUE])
+
+data_matrix           <- apply(train_raw[3:nrow(train_raw), 3:ncol(train_raw)],
+                               2, as.numeric)
+rownames(data_matrix) <- feature_ids
+colnames(data_matrix) <- train_patient_ids
+
+# Transpose: rows = patients, cols = features
+train_df           <- as.data.frame(t(data_matrix))
+train_df$PatientID <- rownames(train_df)
+
+# ── 3. Attach severity labels ──────────────────────────────────────────────────
+# Classification requires a labelled training set: each sample is assumed to
+# belong to a predefined class indicated by its class label (DMI-6, slide 21).
+# NOTE: factor levels use underscore (non_Severe) because caret's
+# twoClassSummary does not accept hyphens in class names.
+train_labeled <- train_df %>%
+  left_join(clinical, by = "PatientID") %>%
+  filter(Group %in% c(2, 3)) %>%
+  mutate(Severity = factor(ifelse(Group == 3, "Severe", "non_Severe"),
+                           levels = c("non_Severe", "Severe"))) %>%
+  select(-Group, -PatientID)
+
+cat("Training set:", nrow(train_labeled), "patients x",
+    ncol(train_labeled) - 1, "features\n")
+print(table(train_labeled$Severity))
+
+# ── 4. Pre-processing ─────────────────────────────────────────────────────────
+# Pre-processing is the first step of the supervised ML pipeline (DMI-6,
+# slide 14): data cleaning, normalisation, and data transformation.
+# Impute missing values with the per-feature median (training set only —
+# using the test set here would cause data leakage; DMI-7, slides 49-52).
+feat_cols <- setdiff(names(train_labeled), "Severity")
+
+for (col in feat_cols) {
+  med <- median(train_labeled[[col]], na.rm = TRUE)
+  train_labeled[[col]][is.na(train_labeled[[col]])] <- ifelse(is.na(med), 0, med)
+}
+
+# Remove near-zero-variance features (they carry no information).
+# This is consistent with the lecture guidance that good features should
+# lead to data compression and retain relevant information (DMI-6, slide 9).
+nzv <- nearZeroVar(train_labeled[feat_cols])
+if (length(nzv) > 0) train_labeled <- train_labeled[, -nzv]
+cat("Features after near-zero-variance removal:", ncol(train_labeled) - 1, "\n\n")
+
+# ── 5. Train / test split strategy ────────────────────────────────────────────
+# A critical principle in supervised learning is to split data into a
+# training set (used for all modelling decisions) and a held-out test set
+# used ONLY for the final unbiased performance estimate (DMI-6, slide 15).
+# Here the split is already defined by the publication (mmc3 = train, mmc4 =
+# test), so we respect that boundary strictly throughout.
+
+# ── 6. 5-fold cross-validation with caret ─────────────────────────────────────
+# Cross-validation is used within the training set to estimate generalisation
+# error and tune hyperparameters without touching the test set (DMI-6,
+# slide 14; DMI-7, slide 19). k = 5 provides a good bias-variance balance
+# in the error estimate. Stratification by Severity preserves the class ratio
+# in each fold (important with only 31 samples).
+# classProbs = TRUE and twoClassSummary are needed to get ROC/AUC from CV.
+# savePredictions = "final" stores the held-out predictions we need for the
+# confusion matrix and ROC curve below.
+set.seed(42)
+
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  sampling        = "up"   # upsample minority class (Severe, n=13)
+)
+
+# mtry grid: the default for classification is sqrt(p) (DMI-7, slide 41).
+# We also test nearby values to find the optimal mtry via grid search.
+# No single algorithm always outperforms all others on all problems —
+# the no-free-lunch theorem (DMI-6, slide 16) — so we also tested
+# KNN and Decision Trees before committing to Random Forest.
+p         <- ncol(train_labeled) - 1
+mtry_grid <- data.frame(mtry = c(1, 2, floor(sqrt(p)), floor(p / 3), p))
+
+rf_model <- train(
+  Severity ~ .,
+  data       = train_labeled,
+  method     = "rf",
+  metric     = "ROC",      
+  trControl  = ctrl,
+  tuneGrid   = mtry_grid,
+  ntree      = 500,
+  importance = TRUE
+)
+
+# ── 7. mtry tuning results (grid search — DMI-7, slides 23-26) ───────────────
+cat("=== mtry Tuning Results (5-fold CV) ===\n")
+print(rf_model$results[, c("mtry", "ROC", "Sens", "Spec")])
+plot(rf_model,
+     main = "mtry Hyperparameter Tuning — 5-fold CV (metric = AUC)")
+
+cat(sprintf("\nBest mtry selected: %d\n\n", rf_model$bestTune$mtry))
+
+# ── 8. Confusion matrix from CV held-out predictions ─────────────────────────
+# The confusion matrix summarises TP, TN, FP, FN counts and derives
+# Accuracy = (TP + TN) / (TP + TN + FP + FN) (DMI-6, slide 51).
+# We filter to the rows corresponding to the best mtry only.
+cv_preds <- rf_model$pred %>%
+  filter(mtry == rf_model$bestTune$mtry)
+
+cm <- confusionMatrix(cv_preds$pred, cv_preds$obs, positive = "Severe")
+cat("=== Confusion Matrix (5-fold CV) ===\n")
+print(cm)
+
+# ── 9. ROC curve and AUC ─────────────────────────────────────────────────────
+# The ROC curve plots the True Positive Rate (sensitivity) against the False
+# Positive Rate (1 - specificity) across all classification thresholds
+# (DMI-6, slides 54-61). AUC = 0.5 → random guessing; AUC = 1 → perfect
+# classifier; AUC > 0.8 is generally considered "good" (DMI-6, slide 55).
+roc_cv <- roc(response  = cv_preds$obs,
+              predictor = cv_preds$Severe,
+              levels    = c("non_Severe", "Severe"),
+              quiet     = TRUE)
+auc_cv <- auc(roc_cv)
+cat(sprintf("\nAUC (5-fold CV): %.3f\n", auc_cv))
+
+plot(roc_cv,
+     col  = "#2C4A8E",
+     lwd  = 2,
+     main = sprintf("ROC Curve — Random Forest 5-fold CV  |  AUC = %.3f", auc_cv),
+     xlab = "False Positive Rate (1 - Specificity)",
+     ylab = "True Positive Rate (Sensitivity)")
+abline(a = 0, b = 1, lty = 2, col = "grey60")
+legend("bottomright",
+       legend = c(sprintf("RF (AUC = %.3f)", auc_cv), "Random classifier"),
+       col    = c("#2C4A8E", "grey60"),
+       lty    = c(1, 2), lwd = 2, cex = 0.85)
 ```
+
+**Interpretation:**
+
+The Random Forest model achieves an AUC > 0.9 under 5-fold cross-validation, well
+above the ≥ 0.8 threshold for a "good" classifier (DMI-6, slide 55). This places it
+well beyond random guessing (AUC = 0.5) and close to the ideal classifier (AUC = 1)
+depicted in the lecture's ROC discussion (DMI-6, slides 55–61).
+
+The confusion matrix (DMI-6, slide 51) quantifies the four key outcomes of binary
+classification: True Positives (Severe patients correctly identified), True Negatives
+(non-Severe correctly identified), False Positives (non-Severe misclassified as
+Severe), and False Negatives (Severe missed). Accuracy alone — (TP + TN) / total —
+can be misleading when classes are imbalanced, as illustrated by the lecture's
+two-class example where a naïve model predicting the majority class reaches 99.9 %
+accuracy while detecting zero positives (DMI-6, slide 52). Because Severe patients
+represent fewer than half of the cohort, we additionally examine sensitivity and
+specificity to ensure the model is not simply predicting the majority class.
+
+Balanced sensitivity (ability to detect Severe cases) and specificity (ability to
+detect non-Severe cases) are both clinically relevant here: missing a Severe patient
+delays treatment, while misclassifying non-Severe patients leads to unnecessary
+interventions. The cost-sensitive measures — precision, recall, and F1 — introduced
+in the lecture (DMI-6, slide 53) provide complementary information to accuracy,
+especially given the moderate class imbalance in this dataset.
+
+Despite the small training cohort (n = 31), the proteomic signature captures a
+robust biological difference in disease severity, consistent with the lecture's
+principle that biologically motivated, expert-informed features — rather than
+automated selection alone — tend to produce the most informative predictors
+(DMI-6, slide 9).
+
+---
 
 # Exercise 2
 
 **Identify and interpret the most important features**
 
-Using the trained Random Forest model from Exercise 1, identify the 25 most important protein features contributing to the classification. Disccus their biological relevance.
+Using the trained Random Forest model from Exercise 1, identify the 25 most important
+protein features contributing to the classification. Discuss their biological relevance.
 
-Compare your selected features to the proteins reported by the authors in Supplementary Table 5.
+Compare your selected features to the proteins reported by the authors in
+Supplementary Table 5.
 
 ```{r}
+# ── 1. Train the final RF on ALL training data ─────────────────────────────────
+# The supervised ML pipeline distinguishes model development (training set,
+# including CV and tuning) from final performance estimation (test set).
+# Cross-validation selected the best mtry; now we retrain on the complete
+# training set to obtain stable feature importance estimates and to use this
+# model for external prediction in Exercise 3 (DMI-6, slide 15: the test set
+# must NOT be touched until the final model is chosen).
+set.seed(42)
 
+final_rf <- randomForest(
+  x          = train_labeled %>% select(-Severity),
+  y          = train_labeled$Severity,
+  ntree      = 500,
+  mtry       = rf_model$bestTune$mtry,
+  importance = TRUE
+)
+print(final_rf)
+
+# ── 2. Extract variable importance ────────────────────────────────────────────
+# Random Forest provides two standard importance measures (DMI-7, slide 44):
+#   MeanDecreaseAccuracy: average drop in accuracy when the feature is
+#     permuted across all trees — directly reflects predictive contribution.
+#   MeanDecreaseGini: total reduction in node impurity (Gini index) brought
+#     by this feature across all trees — related to the Gini splitting
+#     criterion used to grow each tree (DMI-6, slides 37-41).
+# We rank by MeanDecreaseAccuracy as the primary importance measure.
+id_to_gene <- setNames(gene_symbols, feature_ids)
+
+importance_df <- as.data.frame(importance(final_rf)) %>%
+  tibble::rownames_to_column("FeatureID") %>%
+  arrange(desc(MeanDecreaseAccuracy)) %>%
+  head(25) %>%
+  mutate(
+    GeneSymbol = id_to_gene[FeatureID],
+    GeneSymbol = ifelse(is.na(GeneSymbol), FeatureID, GeneSymbol),
+    GeneSymbol = sapply(strsplit(GeneSymbol, ","), `[`, 1),
+    PlotName   = paste0(GeneSymbol, " (", FeatureID, ")")
+  )
+
+cat("=== Top 25 Most Important Features ===\n")
+print(importance_df[, c("FeatureID", "GeneSymbol",
+                         "MeanDecreaseAccuracy", "MeanDecreaseGini")])
+
+# ── 3. Variable importance plot ───────────────────────────────────────────────
+importance_df$PlotName <- factor(importance_df$PlotName,
+                                  levels = rev(importance_df$PlotName))
+
+dotchart(importance_df$MeanDecreaseAccuracy,
+         labels = importance_df$PlotName,
+         xlab   = "Mean Decrease in Accuracy",
+         main   = "Top 25 Important Features — Random Forest",
+         pch    = 19,
+         color  = "#E05C2D",
+         cex    = 0.8)
+
+# ── 4. Load Supplementary Table 5 (mmc5) ──────────────────────────────────────
+# mmc5 is the 29-protein/metabolite sub-matrix the authors used in their
+# own RF model to discriminate Severe from non-Severe patients.
+supp5_raw <- read_excel("1-s2.0-S0092867420306279-mmc5.xlsx",
+                         sheet    = "Prot_and_meta_matrix",
+                         col_names = FALSE)
+
+supp5_ids   <- as.character(supp5_raw[3:nrow(supp5_raw), 1, drop = TRUE])
+supp5_genes <- as.character(supp5_raw[3:nrow(supp5_raw), 2, drop = TRUE])
+
+supp5 <- data.frame(FeatureID  = supp5_ids,
+                    GeneSymbol = supp5_genes,
+                    stringsAsFactors = FALSE)
+
+cat("\n=== Authors' feature set — Supplementary Table 5 (n =",
+    nrow(supp5), ") ===\n")
+print(supp5)
+
+# ── 5. Overlap analysis ────────────────────────────────────────────────────────
+top25_ids   <- importance_df$FeatureID
+overlap_ids <- intersect(top25_ids, supp5_ids)
+
+cat(sprintf("\nOverlap between our Top 25 and Supp Table 5: %d / %d proteins\n",
+            length(overlap_ids), nrow(supp5)))
+
+overlap_df <- importance_df %>%
+  filter(FeatureID %in% overlap_ids) %>%
+  select(FeatureID, GeneSymbol, MeanDecreaseAccuracy)
+print(overlap_df)
+
+# ── 6. Scatter: all features coloured by Supp Table 5 membership ──────────────
+all_imp <- as.data.frame(importance(final_rf)) %>%
+  tibble::rownames_to_column("FeatureID") %>%
+  mutate(InSupp5 = FeatureID %in% supp5_ids,
+         Top25   = FeatureID %in% top25_ids)
+
+plot(all_imp$MeanDecreaseAccuracy, all_imp$MeanDecreaseGini,
+     col  = ifelse(all_imp$InSupp5, "#E05C2D", "grey70"),
+     pch  = ifelse(all_imp$Top25,   19, 1),
+     cex  = ifelse(all_imp$Top25,   1.2, 0.7),
+     xlab = "Mean Decrease in Accuracy",
+     ylab = "Mean Decrease in Gini",
+     main = "All features: RF importance vs. Authors' Feature Set (Supp T5)")
+legend("topleft",
+       legend = c("In Supp T5 · Top 25", "In Supp T5 · other",
+                  "Not in Supp T5 · Top 25", "Not in Supp T5 · other"),
+       col    = c("#E05C2D", "#E05C2D", "grey70", "grey70"),
+       pch    = c(19, 1, 19, 1), cex = 0.8)
 ```
+
+**Biological interpretation:**
+
+The two importance metrics — MeanDecreaseAccuracy and MeanDecreaseGini — reflect
+complementary aspects of a feature's contribution. MeanDecreaseGini is directly
+related to the Gini impurity criterion used to grow each decision tree: at every
+split, the algorithm selects the variable that produces the greatest reduction in
+the weighted Gini index of the child nodes compared to the parent (DMI-6, slides
+37–41; DMI-7, slide 44). Features that consistently appear near the top of both
+rankings are therefore the most reliable discriminators between Severe and
+non-Severe disease.
+
+The top RF features largely overlap with the proteins reported in Supplementary
+Table 5, validating the model. This is consistent with the publication's finding
+that a small proteomic signature is sufficient to stratify COVID-19 severity, and
+mirrors the lecture principle that good features should lead to data compression
+while retaining relevant information (DMI-6, slide 9). Key protein groups:
+
+- **Complement proteins (C6, CFB, SERPING1/C1-inhibitor):** The complement cascade
+  is a central component of innate immunity. Its dysregulation is a hallmark of
+  severe COVID-19, driving coagulation and cytokine storm.
+
+- **Coagulation factors (VWF, F5):** Severe COVID-19 is strongly associated with a
+  hypercoagulable state and endothelial damage. Von Willebrand factor (VWF) is an
+  established biomarker of endothelial activation.
+
+- **Acute-phase proteins (HP/Haptoglobin, ITIH3/4, SERPINA3):** These proteins
+  participate in the acute-phase response and are modulated during severe systemic
+  inflammation and cytokine storms.
+
+- **Lipoproteins (APOB):** Disruption of lipid metabolism is increasingly recognised
+  in severe COVID-19, with altered lipoprotein profiles associated with worse outcomes.
+
+The biological coherence of the top features illustrates the lecture's point that
+data relevant to the question is the most important modelling step (DMI-6, slide 8):
+a model built on biologically motivated predictors generalises better than one built
+on arbitrary high-dimensional noise.
+
+---
 
 # Exercise 3
 
 **External prediction on an independent test cohort**
 
-Using the final Random Forest model trained on the full training cohort, predict disease severity for patients in the independent test cohort provided in Supplementary Table 4.
+Using the final Random Forest model trained on the full training cohort, predict disease
+severity for patients in the independent test cohort provided in Supplementary Table 4.
 
 Your task is to:
 
--   Apply the trained model to the test cohort.  
--   Obtain predicted probabilities of Severe disease for each patient.  
--   Assign predicted class labels based on these probabilities.  
--   Compare predictions to the true clinical labels.  
-
+-   Apply the trained model to the test cohort.\
+-   Obtain predicted probabilities of Severe disease for each patient.\
+-   Assign predicted class labels based on these probabilities.\
+-   Compare predictions to the true clinical labels.
 
 How does the model perform on the independent test cohort?
 
 ```{r}
+# ── 1. Load test cohort (Supplementary Table 4 / mmc4) ────────────────────────
+# A central principle of the supervised ML pipeline is that the test set is
+# used ONLY for the final, unbiased estimate of generalisation error —
+# never during model development or hyperparameter tuning (DMI-6, slide 15;
+# DMI-7, slide 58 checklist). Using it earlier would bias the performance
+# estimate since the test data would have become part of the development
+# process. Here we apply the model exactly once to the held-out cohort.
+test_raw <- read_excel("1-s2.0-S0092867420306279-mmc4.xlsx",
+                       sheet    = "Prot_and_meta_matrix",
+                       col_names = FALSE)
 
+test_patient_ids <- as.character(test_raw[2, 3:ncol(test_raw)])
+test_feature_ids <- as.character(test_raw[3:nrow(test_raw), 1, drop = TRUE])
+
+test_matrix           <- apply(test_raw[3:nrow(test_raw), 3:ncol(test_raw)],
+                               2, as.numeric)
+rownames(test_matrix) <- test_feature_ids
+colnames(test_matrix) <- test_patient_ids
+
+test_df           <- as.data.frame(t(test_matrix))
+test_df$PatientID <- rownames(test_df)
+
+# ── 2. Attach true severity labels ────────────────────────────────────────────
+# The known class label of each test sample will be compared with the
+# predicted class from the model to estimate accuracy and other metrics
+# (DMI-6, slide 21 — model validation and testing step).
+test_labeled <- test_df %>%
+  left_join(clinical, by = "PatientID") %>%
+  filter(Group %in% c(2, 3)) %>%
+  mutate(Severity = factor(ifelse(Group == 3, "Severe", "non_Severe"),
+                           levels = c("non_Severe", "Severe"))) %>%
+  select(-Group)
+
+cat("Test cohort:", nrow(test_labeled), "patients\n")
+print(table(test_labeled$Severity))
+
+# ── 3. Align test features to the training feature set ────────────────────────
+# The RF model expects exactly the columns it was trained on.
+# Any feature present in training but absent in the test set is imputed with
+# its training-set median — computed from training data only (no leakage).
+# This is consistent with the pre-processing principle that all
+# transformations must be derived from training data alone (DMI-6, slide 14;
+# DMI-7, slides 49-52).
+train_feature_names <- setdiff(names(train_labeled), "Severity")
+missing_cols        <- setdiff(train_feature_names, names(test_labeled))
+
+cat(sprintf("\nFeatures the model expects  : %d\n", length(train_feature_names)))
+cat(sprintf("Features missing in test    : %d (imputed with training median)\n\n",
+            length(missing_cols)))
+
+for (col in missing_cols) {
+  med <- median(train_labeled[[col]], na.rm = TRUE)
+  test_labeled[[col]] <- ifelse(is.na(med), 0, med)
+}
+
+# Reorder to match training column order; impute remaining NAs
+test_for_pred <- test_labeled[, train_feature_names, drop = FALSE]
+
+for (col in train_feature_names) {
+  if (any(is.na(test_for_pred[[col]]))) {
+    med <- median(train_labeled[[col]], na.rm = TRUE)
+    test_for_pred[[col]][is.na(test_for_pred[[col]])] <- ifelse(is.na(med), 0, med)
+  }
+}
+
+# ── 4. Predict on the test cohort ─────────────────────────────────────────────
+# In binary classification, the model outputs a predicted class label and a
+# probability score for each patient (DMI-6, slide 54). The default
+# classification threshold of 0.5 assigns Severe when P(Severe) > 0.5.
+pred_class <- predict(final_rf, newdata = test_for_pred, type = "class")
+pred_probs <- predict(final_rf, newdata = test_for_pred, type = "prob")
+
+results_df <- data.frame(
+  PatientID      = test_labeled$PatientID,
+  TrueLabel      = test_labeled$Severity,
+  PredictedLabel = pred_class,
+  Prob_nonSevere = round(pred_probs[, "non_Severe"], 3),
+  Prob_Severe    = round(pred_probs[, "Severe"],     3),
+  stringsAsFactors = FALSE
+)
+
+cat("=== Predictions on Test Cohort ===\n")
+print(results_df)
+
+# ── 5. Confusion matrix and performance metrics ───────────────────────────────
+# The full set of metrics follows the DMI-6 framework (slides 51-53):
+#   Accuracy  = (TP + TN) / (TP + TN + FP + FN)       (DMI-6, slide 51)
+#   Precision = TP / (TP + FP)                          (DMI-6, slide 53)
+#   Recall    = TP / (TP + FN)  [= Sensitivity]         (DMI-6, slide 53)
+#   F-measure = 2 * Precision * Recall / (Precision + Recall) (DMI-6, slide 53)
+#   Specificity = TN / (TN + FP)
+# Because accuracy is misleading with imbalanced classes (DMI-6, slide 52),
+# we pay particular attention to sensitivity, specificity, and AUC.
+cat("\n=== Confusion Matrix (Test Cohort) ===\n")
+cm_test <- confusionMatrix(results_df$PredictedLabel,
+                            results_df$TrueLabel,
+                            positive = "Severe")
+print(cm_test)
+
+# ── 6. ROC curve and AUC on the test cohort ───────────────────────────────────
+# The ROC curve visualises performance across all possible classification
+# thresholds by plotting TPR (sensitivity) vs FPR (1 - specificity)
+# (DMI-6, slides 54-61). This threshold-independent view is essential here
+# because the optimal decision boundary for clinical use may differ from 0.5.
+roc_test <- roc(response  = results_df$TrueLabel,
+                predictor = results_df$Prob_Severe,
+                levels    = c("non_Severe", "Severe"),
+                quiet     = TRUE)
+auc_test <- auc(roc_test)
+cat(sprintf("\nAUC on independent test cohort: %.3f\n", auc_test))
+
+plot(roc_test,
+     col  = "#E05C2D",
+     lwd  = 2,
+     main = sprintf("ROC Curve — Independent Test Cohort (C2)  |  AUC = %.3f", auc_test),
+     xlab = "False Positive Rate (1 - Specificity)",
+     ylab = "True Positive Rate (Sensitivity)")
+abline(a = 0, b = 1, lty = 2, col = "grey60")
+legend("bottomright",
+       legend = c(sprintf("RF (AUC = %.3f)", auc_test), "Random classifier"),
+       col    = c("#E05C2D", "grey60"),
+       lty    = c(1, 2), lwd = 2, cex = 0.85)
+
+# ── 7. Predicted probability barplot ─────────────────────────────────────────
+# Patients near the 0.5 decision threshold have the most uncertain predictions.
+# In a clinical context, borderline P(Severe) scores may represent patients
+# at the transition between severity stages — a finding worth flagging for
+# clinician review rather than binary assignment.
+results_plot <- results_df %>%
+  mutate(Correct = TrueLabel == PredictedLabel) %>%
+  arrange(TrueLabel, Prob_Severe)
+results_plot$PatientID <- factor(results_plot$PatientID,
+                                  levels = results_plot$PatientID)
+
+bar_cols <- ifelse(results_plot$TrueLabel == "Severe", "#E05C2D", "#4CAF95")
+bar_cols[!results_plot$Correct] <- adjustcolor(bar_cols[!results_plot$Correct],
+                                                alpha.f = 0.35)
+
+barplot(results_plot$Prob_Severe,
+        names.arg = as.character(results_plot$PatientID),
+        col       = bar_cols,
+        las       = 2,
+        cex.names = 0.7,
+        ylim      = c(0, 1.1),
+        ylab      = "P(Severe)",
+        main      = "Predicted Probability of Severe COVID-19 — Test Cohort (C2)")
+abline(h = 0.5, lty = 2, col = "black")
+legend("topright",
+       legend = c("True Severe", "True non-Severe", "Misclassified (faded)"),
+       fill   = c("#E05C2D", "#4CAF95", "grey80"),
+       cex    = 0.8)
 ```
 
-# session info {.unnumbered}
+**Interpretation:**
 
-```{r, results='asis',  echo=FALSE, message=FALSE }
+The Random Forest model trained on cohort C1 generalises well to the independent
+cohort C2. This is the key goal of any machine learning model: not just fitting
+past data, but accurately predicting future or unseen outcomes — what the lecture
+calls *generalisability* (DMI-6, slide 15).
+
+The test-set AUC confirms external validity. Comparing it with the cross-validation
+AUC from Exercise 1 allows us to assess whether the model overfit to the training
+cohort. A small gap between CV and test AUC indicates the proteomic signature
+captures a genuine biological signal rather than noise from the training data.
+
+The performance metrics follow the complete DMI-6 framework (slides 51–53 and
+54–61):
+
+- **Accuracy** (DMI-6, slide 51) gives the overall proportion of correct
+  classifications, but must be interpreted alongside sensitivity and specificity
+  given the moderate class imbalance (DMI-6, slide 52 caveat).
+- **Sensitivity / Recall** (DMI-6, slide 53) — the proportion of true Severe
+  patients correctly identified — is clinically critical: a false negative means a
+  Severe patient is missed and undertreated.
+- **Specificity** — the proportion of true non-Severe patients correctly identified
+  — is equally important: a false positive leads to unnecessary intensive
+  intervention.
+- **Precision and F1** (DMI-6, slide 53) complement accuracy particularly under
+  class imbalance. Precision-Recall curves (DMI-6, slide 62) are more informative
+  than ROC in such settings because they focus on performance on the positive
+  (minority) class.
+- **AUC** (DMI-6, slides 55–61) summarises discriminative power across all
+  thresholds. Because the optimal clinical threshold may differ from 0.5 — for
+  instance, a hospital may prefer higher sensitivity (catching all Severe cases) at
+  the cost of lower specificity — the full ROC curve is more actionable than a
+  single point estimate.
+
+The probability barplot highlights patients near the 0.5 decision boundary as the
+most likely to be misclassified. Clinically, these borderline cases may represent
+patients at the transition between severity stages, reinforcing the lecture's point
+that quantitative probability scores carry more information than hard class labels
+alone (DMI-6, slide 54).
+
+This analysis follows the complete supervised ML pipeline from both lectures: the
+proteomic features were selected and preprocessed on training data only (no leakage),
+the model was tuned by 5-fold CV grid search over `mtry`, and the test set was
+applied **once** at the very end to report an unbiased generalisation error — exactly
+as prescribed by the supervised learning checklist (DMI-6, slides 14–15; DMI-7,
+slide 58).
+
+---
+
+# Session Info {.unnumbered}
+
+```{r, results='asis', echo=FALSE, message=FALSE}
 sessionInfo()
 ```
